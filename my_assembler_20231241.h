@@ -55,6 +55,7 @@ typedef struct _symbol
 {
     char symbol[10];
     int addr;
+    int section;    // 새로 추가: 심볼이 속한 섹션 번호 (407호 엄지환 조교님)
 } symbol;
 
 /*

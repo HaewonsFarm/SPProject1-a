@@ -45,6 +45,9 @@ char* input_file;
 char* output_file;
 
 int literal_count = 0;  // 리터럴 테이블 항목 수
+int literalPoolStart = 0;   // 현재 섹션의 미처리 리터럴 시작 인덱스
+
+int current_section = 1;    // 현재 섹션 번호 관리
 
 /* 함수 선언부 */
 int init_my_assembler(void);
@@ -59,6 +62,8 @@ static int assem_pass1(void);
 static int assem_pass2(void);
 void make_opcode_output(char* file_name);
 void make_symtab_output(char* file_name);
+void extract_literal(const char* literalStr, char* dest);
+void process_literal_pool(void);
 void make_literaltab_output(char* filename);
 void make_objectcode_output(char* file_name);
 
@@ -238,7 +243,16 @@ int token_parsing(char *str)
         return -1;
     memset(t, 0, sizeof(token));
     
-    // 주석 라인 (첫 글자 '.')
+    // 앞뒤 공백 제거
+    str = trim(str);
+    
+    // 만약 전체 문자열이 빈 문자열이면 바로 종료
+    if (strlen(str) == 0) {
+        free(t);
+        return 0;
+    }
+    
+    // 주석 라인 처리 (첫 글자 '.')
     if (str[0] == '.') {
         strncpy(t->comment, str, sizeof(t->comment) - 1);
         t->label = strdup("");
@@ -248,27 +262,24 @@ int token_parsing(char *str)
         return 0;
     }
     
-    str = trim(str);
-    if (strlen(str) == 0) {
-        // 빈 줄이면 토큰 구조를 추가하지 않고 그냥 끝냄
-        free(t);
-        return 0;
-    }
     char *saveptr;
     char *token_str = strtok_r(str, " \t", &saveptr);
     int count = 0;
     while (token_str != NULL && count < MAX_COLUMNS) {
-        token_str = trim(token_str);
+        token_str = trim(token_str);  // 각 토큰별 공백 제거
         if (count == 0) {
-            // 첫 토큰: 조건에 따라 operator로 할당하거나 label로 할당
+            // 첫 토큰: 만약 토큰이 "END", "LTORG", "EXTDEF", "EXTREF" 등 지시어와 정확히 일치하면
+            // 이를 operator에 저장합니다.
             if (strcasecmp(token_str, "END") == 0 ||
+                strcasecmp(token_str, "LTORG") == 0 ||
+                strcasecmp(token_str, "EXTDEF") == 0 ||
+                strcasecmp(token_str, "EXTREF") == 0 ||
                 (search_opcode(token_str) >= 0) ||
                 (token_str[0] == '+' && search_opcode(token_str + 1) >= 0)) {
                 t->operator = strdup(token_str);
                 t->label = strdup("");
             } else {
                 t->label = strdup(token_str);
-                // operator가 설정되지 않으면 기본적으로 빈 문자열로 초기화
                 t->operator = strdup("");
             }
         } else if (count == 1) {
@@ -283,9 +294,15 @@ int token_parsing(char *str)
         count++;
         token_str = strtok_r(NULL, " \t", &saveptr);
     }
-    if (t->operator && strlen(t->operator) > 0) {
+    
+    if (t->operator == NULL)
+        t->operator = strdup("");
+    if (t->operand[0] == NULL)
+        t->operand[0] = strdup("");
+    if (strlen(t->operator) > 0) {
         to_upper(t->operator);
     }
+    
     token_table[token_line++] = t;
     return 0;
 }
@@ -365,10 +382,7 @@ int get_instruction_length(char* op) {
 */
 static int assem_pass1(void)
 {
-    /* input_data의 문자열을 한줄씩 입력 받아서
-     * token_parsing()을 호출하여 _token에 저장
-     */
-    /* 모든 소스 라인에 대해 토큰 파싱 */
+    // 모든 소스 라인에 대해 토큰 파싱
     for (int i = 0; i < line_num; i++) {
         char* line_copy = strdup(input_data[i]);
         if (token_parsing(line_copy) < 0) {
@@ -378,29 +392,103 @@ static int assem_pass1(void)
         free(line_copy);
     }
     
+    // 첫 번째 라인의 경우, 만약 label이 비어있고, operator가 "START"가 아니면
+    // operator를 프로그램 이름(label)으로 취급
+    if (token_line > 0 &&
+        strlen(token_table[0]->label) == 0 &&
+        strlen(token_table[0]->operator) > 0 &&
+        strcasecmp(token_table[0]->operator, "START") != 0) {
+        token_table[0]->label = strdup(token_table[0]->operator);
+        token_table[0]->operator[0] = '\0';
+    }
+    
     locctr = 0;
+    literalPoolStart = 0;
+    current_section = 1;  // 첫 섹션
+    
     for (int i = 0; i < token_line; i++) {
         token* t = token_table[i];
         if (t->comment[0] == '.')
             continue;
+        if (t->operator == NULL)
+            t->operator = strdup("");
         
-        if (strcasecmp(t->operator, "START") == 0) {    // t->operator가 NULL인 경우 strcasecmp에 전달되어 EXC_BAD_ACCESS 오류(널 포인터 접근 오류) 발생
+        // START 지시어: locctr 초기화
+        if (strcasecmp(t->operator, "START") == 0) {
             locctr = (int)strtol(t->operand[0], NULL, 16);
             if (strlen(t->label) > 0) {
-                strcpy(sym_table[label_num].symbol,t->label);
+                strcpy(sym_table[label_num].symbol, t->label);
                 sym_table[label_num].addr = locctr;
+                sym_table[label_num].section = current_section;
                 label_num++;
             }
             continue;
         }
         
+        // CSECT 지시어: 섹션 전환 → pending literal 처리 후,
+        // locctr를 0으로 리셋하고 current_section 증가
+        if (strcasecmp(t->operator, "CSECT") == 0) {
+            process_literal_pool();
+            locctr = 0;
+            literalPoolStart = literal_count;
+            current_section++;
+            if (strlen(t->label) > 0) {
+                strcpy(sym_table[label_num].symbol, t->label);
+                sym_table[label_num].addr = locctr;
+                sym_table[label_num].section = current_section;
+                label_num++;
+            }
+            continue;
+        }
+        
+        // EQU 지시어 처리 (예: MAXLEN EQU BUFEND-BUFFER)
+        if (strcasecmp(t->operator, "EQU") == 0) {
+            int value = 0;
+            if (strcmp(t->operand[0], "*") == 0) {
+                value = locctr;
+            }
+            else if (strchr(t->operand[0], '-') != NULL) {
+                char left[32] = {0}, right[32] = {0};
+                sscanf(t->operand[0], "%[^-]-%s", left, right);
+                int leftVal = -1, rightVal = -1;
+                for (int k = 0; k < label_num; k++) {
+                    if (strcmp(sym_table[k].symbol, left) == 0)
+                        leftVal = sym_table[k].addr;
+                    if (strcmp(sym_table[k].symbol, right) == 0)
+                        rightVal = sym_table[k].addr;
+                }
+                if (leftVal != -1 && rightVal != -1)
+                    value = leftVal - rightVal;
+            }
+            else {
+                value = (int)strtol(t->operand[0], NULL, 16);
+            }
+            if (strlen(t->label) > 0) {
+                strcpy(sym_table[label_num].symbol, t->label);
+                sym_table[label_num].addr = value;
+                sym_table[label_num].section = current_section;
+                label_num++;
+            }
+            continue;
+        }
+        
+        // EXTDEF, EXTREF는 심볼 테이블에 등록하지 않음
+        if (strcasecmp(t->operator, "EXTDEF") == 0 ||
+            strcasecmp(t->operator, "EXTREF") == 0 ||
+            strcasecmp(t->label, "EXTDEF") == 0 ||
+            strcasecmp(t->label, "EXTREF") == 0) {
+            continue;
+        }
+        
+        // 일반 심볼: 라벨이 있으면 등록
         if (strlen(t->label) > 0) {
             strcpy(sym_table[label_num].symbol, t->label);
             sym_table[label_num].addr = locctr;
+            sym_table[label_num].section = current_section;
             label_num++;
         }
         
-        /* 리터럴 처리: operand가 '='로 시작하면 literal_table 에 저장 */
+        // 리터럴 처리: operand가 '='로 시작하면 등록 (pending literal)
         if (t->operand[0] && t->operand[0][0] == '=') {
             int found = 0;
             for (int j = 0; j < literal_count; j++) {
@@ -416,6 +504,7 @@ static int assem_pass1(void)
             }
         }
         
+        // directive/명령어에 따라 locctr 증분
         if (strcasecmp(t->operator, "WORD") == 0) {
             locctr += 3;
         } else if (strcasecmp(t->operator, "RESW") == 0) {
@@ -425,60 +514,26 @@ static int assem_pass1(void)
             int num = atoi(t->operand[0]);
             locctr += num;
         } else if (strcasecmp(t->operator, "BYTE") == 0) {
-            if (t->operand[0][0] == 'C' || t->operand[0][0]=='c') {
+            if (t->operand[0][0]=='C' || t->operand[0][0]=='c') {
                 char* start = strchr(t->operand[0], '\'');
                 char* end = strrchr(t->operand[0], '\'');
                 if (start && end && end > start)
                     locctr += (end - start - 1);
-            } else if (t->operand[0][0] == 'X' || t->operand[0][0]=='x') {
+            } else if (t->operand[0][0]=='X' || t->operand[0][0]=='x') {
                 char* start = strchr(t->operand[0], '\'');
                 char* end = strrchr(t->operand[0], '\'');
                 if (start && end && end > start)
                     locctr += ((end - start - 1) + 1) / 2;
             }
-        } else if (strcasecmp(t->operator, "LTORG") == 0) {
-            // 등록된 리터럴에 대해 주소 할당
-            for (int j = 0; j < literal_count; j++) {
-                if (literal_table[j].addr == -1) {
-                    char* lit = literal_table[j].symbol;
-                    int length = 0;
-                    if (lit[1] == 'C' || lit[1] == 'c') {
-                        char* start = strchr(lit, '\'');
-                        char* end = strrchr(lit, '\'');
-                        if (start && end && end > start)
-                            length = end - start - 1;
-                    } else if (lit[1] == 'X' || lit[1] == 'x') {
-                        char* start = strchr(lit, '\'');
-                        char* end = strrchr(lit, '\'');
-                        if (start && end && end > start)
-                            length = ((end - start - 1) + 1) / 2;
-                    }
-                    literal_table[j].addr = locctr;
-                    locctr += length;
-                }
-            }
-        } else if (strcasecmp(t->operator, "END") == 0) {
-            for (int j = 0; j < literal_count; j++) {
-                if (literal_table[j].addr == -1) {
-                    char* lit = literal_table[j].symbol;
-                    int length = 0;
-                    if (lit[1] == 'C' || lit[1] == 'c') {
-                        char* start = strchr(lit, '\'');
-                        char* end = strrchr(lit, '\'');
-                        if (start && end && end > start)
-                            length  = end - start - 1;
-                    } else if (lit[1] == 'X' || lit[1] == 'x') {
-                        char* start = strchr(lit, '\'');
-                        char* end = strrchr(lit, '\'');
-                        if (start && end && end > start)
-                            length = ((end - start - 1) + 1) / 2;
-                    }
-                    literal_table[j].addr = locctr;
-                    locctr += length;
-                }
-            }
+        }
+        else if (strcasecmp(t->operator, "LTORG") == 0) {
+            process_literal_pool();
+        }
+        else if (strcasecmp(t->operator, "END") == 0) {
+            process_literal_pool();
             break;
-        } else {
+        }
+        else {
             int ins_length = get_instruction_length(t->operator);
             locctr += ins_length;
         }
@@ -559,11 +614,60 @@ void make_symtab_output(char *file_name)
             return;
         }
     }
+    
     for (int i = 0; i < label_num; i++) {
-        fprintf(fp, "%-8s %04X\n", sym_table[i].symbol, sym_table[i].addr);
+        if (i > 0 && sym_table[i].section != sym_table[i-1].section)
+            fprintf(fp, "\n"); // 섹션 변경 시 개행
+        fprintf(fp, "%-8s\t%X\n", sym_table[i].symbol, sym_table[i].addr);
     }
+    
     if (fp != stdout)
         fclose(fp);
+}
+
+// literal의 내부 내용을 추출하는 함수
+void extract_literal(const char* literalStr, char* dest) {
+    if (literalStr == NULL || dest == NULL)
+        return;
+    // literalStr이 '='로 시작하고, 그 다음에 'C' 혹은 'X'가 있는 경우
+    if(literalStr[0]=='=' && (literalStr[1]=='C' || literalStr[1]=='c' ||
+                              literalStr[1]=='X' || literalStr[1]=='x')) {
+        const char* start = strchr(literalStr, '\'');
+        const char* end = strrchr(literalStr, '\'');
+        if(start != NULL && end != NULL && end > start) {
+            size_t len = end - start - 1;
+            strncpy(dest, start + 1, len);
+            dest[len] = '\0';
+            return;
+        }
+    }
+    // 그 외는 그대로 복사
+    strcpy(dest, literalStr);
+}
+
+/* 현재 섹션의 미할당 리터럴에 대해 현재 locctr 값을 할당하고
+   literal의 길이만큼 locctr를 증가시키며, literalPoolStart를 갱신 */
+void process_literal_pool(void) {
+    for (int j = literalPoolStart; j < literal_count; j++) {
+        if (literal_table[j].addr == -1) {
+            literal_table[j].addr = locctr;
+            char* lit = literal_table[j].symbol;
+            int length = 0;
+            if (lit[1]=='C' || lit[1]=='c') {
+                char* start = strchr(lit, '\'');
+                char* end = strrchr(lit, '\'');
+                if (start && end && end > start)
+                    length = end - start - 1;
+            } else if (lit[1]=='X' || lit[1]=='x') {
+                char* start = strchr(lit, '\'');
+                char* end = strrchr(lit, '\'');
+                if (start && end && end > start)
+                    length = ((end - start - 1) + 1) / 2;
+            }
+            locctr += length;
+        }
+    }
+    literalPoolStart = literal_count;
 }
 
 /* ----------------------------------------------------------------------------------
@@ -589,8 +693,11 @@ void make_literaltab_output(char* file_name)
             return;
         }
     }
+    
     for (int i = 0; i < literal_count; i++) {
-        fprintf(fp, "%-8s %04X\n", literal_table[i].symbol, literal_table[i].addr);
+        char litValue[32] = {0};
+        extract_literal(literal_table[i].symbol, litValue);
+        fprintf(fp, "%-8s\t%X\n", litValue, literal_table[i].addr);
     }
     if (fp != stdout)
         fclose(fp);
