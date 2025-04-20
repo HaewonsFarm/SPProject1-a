@@ -25,6 +25,7 @@
 #define MAX_COLUMNS 3
 #define MAX_TEXT_RECORD_LENGTH 30   // Text record 최대 바이트 수
 #define MAX_EXTREF 100
+#define MAX_SECTIONS 10
 
 /* 전역 변수 정의 */
 inst* inst_table[MAX_INST];
@@ -42,6 +43,7 @@ symbol sym_table[MAX_LINES];
 symbol literal_table[MAX_LINES];
 
 int locctr = 0;
+int locctr_table[MAX_LINES];
 
 char* input_file;
 char* output_file;
@@ -50,6 +52,7 @@ int literal_count = 0;  // 리터럴 테이블 항목 수
 int literalPoolStart = 0;   // 현재 섹션의 미처리 리터럴 시작 인덱스
 
 int current_section = 1;    // 현재 섹션 번호 관리
+int section_length[MAX_SECTIONS];
 
 char extref_table[MAX_EXTREF][32];
 int extref_count = 0;
@@ -72,9 +75,11 @@ void extract_literal(const char* literalStr, char* dest);
 void process_literal_pool(void);
 static int get_register_number(const char *r);
 int calc_disp(int target, int current, int format, int base, int e, int *b, int *p);
-void calc_nixbpe(token* t, int baseOpcode, int *finalOpcode, int *n, int *i, int *x, int *e, int *targetAddr);
+void calc_nixbpe(token* t, int baseOpcode,
+                 int *finalOpcode, int *n, int *i,
+                 int *x, int *e, int *targetAddr);
 char* generate_object_code(token* t);
-char* generate_modification_record(token* t);
+char** generate_modification_records(token* t, int* count);
 static int assem_pass2(void);
 void make_opcode_output(char* file_name);
 void make_objectcode_output(char* file_name);
@@ -99,7 +104,6 @@ int main(int args, char *arg[])
         printf("assem_pass1: 패스1 과정에서 실패하였습니다.  \n");
         return -1;
     }
-
 
     make_symtab_output("output_symtab.txt");
     make_literaltab_output("output_littab.txt");
@@ -246,74 +250,91 @@ void to_upper(char* s) {
  - 그 외의 경우 첫 토큰은 label, 두 번째는 operator, 세 번째는 operand */
 int token_parsing(char *str)
 {
-    if (str == NULL)
-        return -1;
-    
-    token* t = (token*)malloc(sizeof(token));
-    if (!t)
-        return -1;
-    memset(t, 0, sizeof(token));
-    
-    // 앞뒤 공백 제거
+    if (str == NULL) return -1;
+
+    // 1) 앞뒤 공백 제거
     str = trim(str);
-    
-    // 만약 전체 문자열이 빈 문자열이면 바로 종료
-    if (strlen(str) == 0) {
-        free(t);
-        return 0;
-    }
-    
-    // 주석 라인 처리 (첫 글자 '.')
+
+    // 2) 빈 라인 → 무시
+    if (strlen(str) == 0) return 0;
+
+    // 3) 주석 라인
     if (str[0] == '.') {
-        strncpy(t->comment, str, sizeof(t->comment) - 1);
-        t->label = strdup("");
+        token* t = calloc(1, sizeof(token));
+        if (!t) return -1;
+        strncpy(t->comment, str, sizeof(t->comment)-1);
+        t->label    = strdup("");
         t->operator = strdup("");
         t->operand[0] = strdup("");
         token_table[token_line++] = t;
         return 0;
     }
-    
-    char *saveptr;
-    char *token_str = strtok_r(str, " \t", &saveptr);
+
+    // 4) 일반 명령어/지시어 라인
+    token* t = calloc(1, sizeof(token));
+    if (!t) return -1;
+    t->label      = strdup("");
+    t->operator   = strdup("");
+    t->operand[0] = strdup("");
+
+    char *saveptr, *tok;
     int count = 0;
-    while (token_str != NULL && count < MAX_COLUMNS) {
-        token_str = trim(token_str);  // 각 토큰별 공백 제거
+
+    tok = strtok_r(str, " \t", &saveptr);
+    while (tok && count < MAX_COLUMNS) {
+        tok = trim(tok);
+
         if (count == 0) {
-            // 첫 토큰: 만약 토큰이 "END", "LTORG", "EXTDEF", "EXTREF" 등 지시어와 정확히 일치하면
-            // 이를 operator에 저장합니다.
-            if (strcasecmp(token_str, "END") == 0 ||
-                strcasecmp(token_str, "LTORG") == 0 ||
-                strcasecmp(token_str, "EXTDEF") == 0 ||
-                strcasecmp(token_str, "EXTREF") == 0 ||
-                (search_opcode(token_str) >= 0) ||
-                (token_str[0] == '+' && search_opcode(token_str + 1) >= 0)) {
-                t->operator = strdup(token_str);
-                t->label = strdup("");
+            // 첫 토큰: 지시어/명령어라면 operator, 아니면 label
+            if (!strcasecmp(tok, "END")  ||
+                !strcasecmp(tok, "LTORG")||
+                !strcasecmp(tok, "EXTDEF")||
+                !strcasecmp(tok, "EXTREF")||
+                search_opcode(tok) >= 0 ||
+                (tok[0]=='+' && search_opcode(tok+1) >= 0))
+            {
+                free(t->operator);
+                t->operator = strdup(tok);
             } else {
-                t->label = strdup(token_str);
-                t->operator = strdup("");
+                free(t->label);
+                t->label = strdup(tok);
             }
-        } else if (count == 1) {
-            if (t->operator == NULL || strlen(t->operator) == 0)
-                t->operator = strdup(token_str);
-            else
-                t->operand[0] = strdup(token_str);
-        } else if (count == 2) {
-            if (t->operand[0] == NULL || strlen(t->operand[0]) == 0)
-                t->operand[0] = strdup(token_str);
         }
+        else if (count == 1) {
+            if (strlen(t->operator) == 0) {
+                // operator 아직 비어 있으면 이 토큰을 operator로
+                free(t->operator);
+                t->operator = strdup(tok);
+            } else {
+                // operator 이미 있으면 이 토큰이 operand
+                free(t->operand[0]);
+                t->operand[0] = strdup(tok);
+                break;  // 남은 건 모두 무시
+            }
+        }
+        else {
+            // count==2: 세 번째 토큰도 operand로 덮어쓰기
+            free(t->operand[0]);
+            t->operand[0] = strdup(tok);
+            break;
+        }
+
         count++;
-        token_str = strtok_r(NULL, " \t", &saveptr);
+        tok = strtok_r(NULL, " \t", &saveptr);
     }
-    
-    if (t->operator == NULL)
-        t->operator = strdup("");
-    if (t->operand[0] == NULL)
-        t->operand[0] = strdup("");
-    if (strlen(t->operator) > 0) {
-        to_upper(t->operator);
+
+    // 5) operator 대문자 정리
+    if (t->operator) to_upper(t->operator);
+
+    // 6) operator 없으면 에러
+    if (!t->operator || strlen(t->operator)==0) {
+        free(t->label);
+        free(t->operator);
+        free(t->operand[0]);
+        free(t);
+        return -1;
     }
-    
+
     token_table[token_line++] = t;
     return 0;
 }
@@ -393,7 +414,7 @@ int get_instruction_length(char* op) {
 */
 static int assem_pass1(void)
 {
-    // 모든 소스 라인에 대해 토큰 파싱
+    // 1) 토큰 파싱 및 테이블 구축
     for (int i = 0; i < line_num; i++) {
         char* line_copy = strdup(input_data[i]);
         if (token_parsing(line_copy) < 0) {
@@ -402,62 +423,71 @@ static int assem_pass1(void)
         }
         free(line_copy);
     }
-    
-    // 첫 번째 라인의 경우, 만약 label이 비어있고, operator가 "START"가 아니면
-    // operator를 프로그램 이름(label)으로 취급
-    if (token_line > 0 &&
-        strlen(token_table[0]->label) == 0 &&
-        strlen(token_table[0]->operator) > 0 &&
-        strcasecmp(token_table[0]->operator, "START") != 0) {
-        token_table[0]->label = strdup(token_table[0]->operator);
-        token_table[0]->operator[0] = '\0';
-    }
-    
+
+    // 2) 초기값 설정
     locctr = 0;
     literalPoolStart = 0;
-    current_section = 1;  // 첫 섹션
-    
+
+    // 3) 패스1 주요 루프: 각 토큰별로 주소 기록 및 locctr 증가
     for (int i = 0; i < token_line; i++) {
         token* t = token_table[i];
+        // 3.1) 현재 locctr을 토큰의 주소로 저장
+        t->addr = locctr;
+        locctr_table[i] = locctr;
+
+        // 3.2) 주석 라인
         if (t->comment[0] == '.')
             continue;
-        if (t->operator == NULL)
-            t->operator = strdup("");
-        
-        // START 지시어: locctr 초기화
-        if (strcasecmp(t->operator, "START") == 0) {
+
+        /// 3.3) START 지시어
+        if (!strcasecmp(t->operator, "START")) {
+            // 프로그램 시작 주소로 locctr 설정
             locctr = (int)strtol(t->operand[0], NULL, 16);
+
+            // ▶ START 다음에 label(COPY)이 있으면 symtab에 추가
             if (strlen(t->label) > 0) {
                 strcpy(sym_table[label_num].symbol, t->label);
-                sym_table[label_num].addr = locctr;
+                sym_table[label_num].addr    = locctr;
                 sym_table[label_num].section = current_section;
                 label_num++;
             }
             continue;
         }
-        
-        // CSECT 지시어: 섹션 전환 → pending literal 처리 후,
-        // locctr를 0으로 리셋하고 current_section 증가
-        if (strcasecmp(t->operator, "CSECT") == 0) {
+
+        // 3.4) CSECT 지시어: 섹션 전환 및 리터럴 풀 처리
+        if (!strcasecmp(t->operator, "CSECT")) {
             process_literal_pool();
+
+            if (locctr > total_program_end)
+                total_program_end = locctr;
+
+            section_length[current_section] = locctr;
+
             locctr = 0;
             literalPoolStart = literal_count;
             current_section++;
+
+            // ▶ CSECT 다음에 label(RDREC, WRREC)이 있으면 symtab에 추가
             if (strlen(t->label) > 0) {
                 strcpy(sym_table[label_num].symbol, t->label);
-                sym_table[label_num].addr = locctr;
+                sym_table[label_num].addr    = locctr;
                 sym_table[label_num].section = current_section;
                 label_num++;
             }
+
             continue;
+
+            // 여기서 locctr은 계산이 잘 된다.
         }
-        
-        // EQU 지시어 처리 (예: MAXLEN EQU BUFEND-BUFFER)
-        if (strcasecmp(t->operator, "EQU") == 0) {
+
+        // 3.5) EQU, EXTDEF, EXTREF 등 기타 지시어 처리 및 심볼 테이블 등록
+        if (!strcasecmp(t->operator, "EQU")) {
             int value = 0;
+            // 1) '*' 이면 현재 주소
             if (strcmp(t->operand[0], "*") == 0) {
-                value = locctr;
+                value = t->addr;
             }
+            // 2) 'SYM1-SYM2' 형태이면 두 심볼의 차이
             else if (strchr(t->operand[0], '-') != NULL) {
                 char left[32] = {0}, right[32] = {0};
                 sscanf(t->operand[0], "%[^-]-%s", left, right);
@@ -471,82 +501,73 @@ static int assem_pass1(void)
                 if (leftVal != -1 && rightVal != -1)
                     value = leftVal - rightVal;
             }
+            // 3) 그 외는 상수(16진수)로 파싱
             else {
                 value = (int)strtol(t->operand[0], NULL, 16);
             }
+
             if (strlen(t->label) > 0) {
                 strcpy(sym_table[label_num].symbol, t->label);
-                sym_table[label_num].addr = value;
+                sym_table[label_num].addr    = value;
                 sym_table[label_num].section = current_section;
                 label_num++;
             }
             continue;
-        }
-        
-        // EXTDEF, EXTREF는 심볼 테이블에 등록하지 않음
-        if (strcasecmp(t->operator, "EXTDEF") == 0 ||
-            strcasecmp(t->operator, "EXTREF") == 0 ||
-            strcasecmp(t->label, "EXTDEF") == 0 ||
-            strcasecmp(t->label, "EXTREF") == 0) {
+        }        if (!strcasecmp(t->operator, "EXTDEF") || !strcasecmp(t->operator, "EXTREF"))
             continue;
-        }
-        
-        // 일반 심볼: 라벨이 있으면 등록
+
+        // 3.6) 라벨이 있으면 심볼 테이블에 추가 (같은 섹션 내에서만 중복 체크)
         if (strlen(t->label) > 0) {
-            strcpy(sym_table[label_num].symbol, t->label);
-            sym_table[label_num].addr = locctr;
-            sym_table[label_num].section = current_section;
-            label_num++;
-        }
-        
-        // 리터럴 처리: operand가 '='로 시작하면 등록 (pending literal)
-        if (t->operand[0] && t->operand[0][0] == '=') {
-            int found = 0;
-            for (int j = 0; j < literal_count; j++) {
-                if (strcmp(literal_table[j].symbol, t->operand[0]) == 0) {
-                    found = 1;
+            int exists = 0;
+            for (int s = 0; s < label_num; s++) {
+                if (!strcmp(sym_table[s].symbol, t->label) 
+                    && sym_table[s].section == current_section) {
+                    exists = 1;
                     break;
                 }
             }
+            if (!exists) {
+                strcpy(sym_table[label_num].symbol, t->label);
+                sym_table[label_num].addr    = t->addr;
+                sym_table[label_num].section = current_section;
+                label_num++;
+            }
+        }
+
+        // 3.7) 리터럴 수집: operand가 '='로 시작하면 리터럴 테이블에 등록
+        if (t->operand[0] && t->operand[0][0] == '=') {
+            int found = 0;
+            for (int j = 0; j < literal_count; j++)
+                if (!strcmp(literal_table[j].symbol, t->operand[0])) { found = 1; break; }
             if (!found) {
                 strcpy(literal_table[literal_count].symbol, t->operand[0]);
                 literal_table[literal_count].addr = -1;
                 literal_count++;
             }
         }
-        
-        // directive/명령어에 따라 locctr 증분
-        if (strcasecmp(t->operator, "WORD") == 0) {
-            locctr += 3;
-        } else if (strcasecmp(t->operator, "RESW") == 0) {
-            int num = atoi(t->operand[0]);
-            locctr += 3 * num;
-        } else if (strcasecmp(t->operator, "RESB") == 0) {
-            int num = atoi(t->operand[0]);
-            locctr += num;
-        } else if (strcasecmp(t->operator, "BYTE") == 0) {
-            if (t->operand[0][0]=='C' || t->operand[0][0]=='c') {
-                char* start = strchr(t->operand[0], '\'');
-                char* end = strrchr(t->operand[0], '\'');
-                if (start && end && end > start)
-                    locctr += (end - start - 1);
-            } else if (t->operand[0][0]=='X' || t->operand[0][0]=='x') {
-                char* start = strchr(t->operand[0], '\'');
-                char* end = strrchr(t->operand[0], '\'');
-                if (start && end && end > start)
-                    locctr += ((end - start - 1) + 1) / 2;
+
+        // 3.8) 지시어/명령어 길이만큼 locctr 증가
+        if (!strcasecmp(t->operator, "WORD"))              locctr += 3;
+        else if (!strcasecmp(t->operator, "RESW")) { int n=atoi(t->operand[0]); locctr += 3*n; }
+        else if (!strcasecmp(t->operator, "RESB")) { int n=atoi(t->operand[0]); locctr += n; }
+        else if (!strcasecmp(t->operator, "BYTE")) {
+            char *start = strchr(t->operand[0], '\'');
+            char *end   = strrchr(t->operand[0], '\'');
+            if (start && end && end>start) {
+                if (toupper((unsigned char)t->operand[0][0]) == 'C')
+                    locctr += end - start - 1;
+                else  // X
+                    locctr += (end - start - 1 + 1) / 2;
             }
         }
-        else if (strcasecmp(t->operator, "LTORG") == 0) {
-            process_literal_pool();
-        }
-        else if (strcasecmp(t->operator, "END") == 0) {
-            process_literal_pool();
+        else if (!strcasecmp(t->operator, "LTORG"))        process_literal_pool();
+        else if (!strcasecmp(t->operator, "END")) { 
+            process_literal_pool(); 
+            section_length[current_section] = locctr;
             break;
         }
-        else {
-            int ins_length = get_instruction_length(t->operator);
-            locctr += ins_length;
+        else {                                            // 형식 1~4 명령어
+            locctr += get_instruction_length(t->operator);
         }
     }
     return 0;
@@ -729,37 +750,43 @@ static int get_register_number(const char *r) {
 
 // PC-Relative, Base-Relative disp 계산
 int calc_disp(int target, int current, int format, int base, int e, int *b, int *p) {
-    int instrLen = (format == 4 || e == 1) ? 4 : 3;
-    int pc = current + instrLen;
-    int disp = target - pc;
+    // 항상 b/p 비트를 0으로 초기화
+    *b = 0;
+    *p = 0;
 
-    // PC-relative
-    if (disp >= -2048 && disp <= 2047) {
-        *b = 0;
-        *p = 1;
-        return disp & 0xFFF;  // 12비트 보정
-    }
-
-    // BASE-relative fallback
-    disp = target - base;
-    if (disp >= 0 && disp <= 4095) {
-        *b = 1;
-        *p = 0;
-        return disp & 0xFFF;
-    }
-
-    // format 4가 아닌데 범위를 벗어나면 오류
-    if (format == 3 && !e) {
-        fprintf(stderr, "Error: displacement out of range at address %X\n", current);
-        *b = 0;
-        *p = 0;
+    // format 4 (extended) 명령어는 disp 필드를 0으로 채우고 M-record로 처리
+    if (e == 1 || format == 4) {
         return 0;
     }
 
-    // format 4일 경우 disp는 20비트 → generate_modification_record()에서 수정
-    *b = 0;
-    *p = 0;
-    return 0;
+    // instruction 길이(PC 계산용)
+    int instrLen = 3;  // format 3
+    int pc = current + instrLen;
+    int disp = target - pc;
+
+    // PC-relative: -2048 ≤ disp ≤ +2047
+    if (disp >= -2048 && disp <= 2047) {
+        *p = 1;
+        if (disp < 0) {
+            disp = 0x1000 + disp;
+        }
+        return disp & 0xFFF;        // 하위 12비트로 자르기
+    }
+
+    // Base-relative: 0 ≤ (target - base) ≤ 4095
+    disp = target - base;
+    if (disp >= 0 && disp <= 4095) {
+        *b = 1;
+        return disp & 0xFFF;
+    }
+
+    // 둘 다 실패하면, format 4로 업그레이드
+    if (disp < -2048 || disp > 4095) {
+        e = 1;    // e는 로컬 변수라 caller에서는 무효함.
+        *b = *p = 0;
+        return 0;
+    }
+    return 0;  // format 4 의 disp 필드는 0
 }
 
 /* ------------------- 모듈화된 op와 nixbpe 계산 함수 ------------------- */
@@ -776,155 +803,249 @@ int calc_disp(int target, int current, int format, int base, int e, int *b, int 
      • 그 외에는 직접 addressing (n=1,i=1); operand에 ",X"가 포함된 경우 x=1 처리
      • operator 앞에 '+'가 있으면 format 4로 e=1
 */
-void calc_nixbpe(token* t, int baseOpcode, int *finalOpcode, int *n, int *i, int *x, int *e, int *targetAddr) {
-    *n = 0; *i = 0; *x = 0; *e = 0;
-    
-    // extended format 확인: operator에 '+'가 있으면 format 4
-    if (t->operator[0] == '+')
+void calc_nixbpe(token* t, int baseOpcode,
+                 int *finalOpcode, int *n, int *i,
+                 int *x, int *e, int *targetAddr)
+{
+    // 1) nixbpe 플래그 0으로 초기화
+    *n = *i = *x = *e = 0;
+
+    // 2) extended format인지 확인
+    if (t->operator[0] == '+') {
         *e = 1;
-    
-    // 주소 지정 방식 및 targetAddr 결정:
+    }
+
+    // 3) immediate addressing
     if (t->operand[0] && t->operand[0][0] == '#') {
-        // Immediate: operand가 숫자 상수일 것으로 가정
         *n = 0; *i = 1;
-        *targetAddr = (int)strtol(t->operand[0] + 1, NULL, 16);
-    } else if (t->operand[0] && t->operand[0][0] == '@') {
-        // Indirect addressing: '@' 제거하고 심볼 테이블 조회
-        *n = 1; *i = 0;
-        char operandCopy[64];
-        strcpy(operandCopy, t->operand[0] + 1);
-        int found = 0;
-        for (int j = 0; j < label_num; j++) {
-            if (strcmp(sym_table[j].symbol, operandCopy) == 0) {
-                *targetAddr = sym_table[j].addr;
-                found = 1;
-                break;
+        // 상수 literal이면 (#5, #0x10, etc.), 각각 parsing
+        if (isdigit((unsigned char)t->operand[0][1])) {
+            *n = 0;
+            *targetAddr = (int)strtol(t->operand[0] + 1, NULL, 16);
+        }
+        else {
+            // symbolic immediate (#LABEL 주소 검색)
+            *n = 0;
+            char symcpy[64];
+            strcpy(symcpy, t->operand[0] + 1);
+            for (int j = 0; j < label_num; j++) {
+                if (strcmp(sym_table[j].symbol, symcpy) == 0) {
+                    *targetAddr = sym_table[j].addr;
+                    break;
+                }
             }
-        }
-        if (!found)
-            *targetAddr = 0;  // 심볼 미발견 시 0 처리 (필요 시 에러 처리)
-    } else {
-        // Direct addressing: 기본값 n=1, i=1
-        *n = 1; *i = 1;
-        char operandCopy[64];
-        strcpy(operandCopy, t->operand[0]);
-        // ",X" 확인하여 indexed addressing 여부 처리
-        char* comma = strstr(operandCopy, ",X");
-        if (comma != NULL) {
-            *x = 1;
-            *comma = '\0';  // ",X" 삭제하여 심볼 이름만 남김
-        }
-        int found = 0;
-        for (int j = 0; j < label_num; j++) {
-            if (strcmp(sym_table[j].symbol, operandCopy) == 0) {
-                *targetAddr = sym_table[j].addr;
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            // 심볼이 없으면 숫자로 처리 (예: 상수값)
-            *targetAddr = (int)strtol(operandCopy, NULL, 16);
         }
     }
-    
-    // 최종 opcode: 원래 baseOpcode의 상위 6비트에 n, i 비트를 덮어씌움
+    // 4) indirect addressing
+    else if (t->operand[0] && t->operand[0][0] == '@') {
+        *n = 1;  *i = 0;
+        char symcpy[64];
+        strcpy(symcpy, t->operand[0] + 1);
+        for (int j = 0; j < label_num; j++) {
+            if (strcmp(sym_table[j].symbol, symcpy) == 0) {
+                *targetAddr = sym_table[j].addr;
+                break;
+            }
+        }
+    }
+    // 5) symple(direct) addressing
+    else {
+        *n = 1;  *i = 1;
+        char symcpy[64];
+        strcpy(symcpy, t->operand[0]);
+        // ",X" 가 나오면 x=1로 바꾸고 parsing
+        char *comma = strstr(symcpy, ",X");
+        if (comma) {
+            *x = 1;
+            *comma = '\0';
+        }
+        // symbol 찾기
+        int found = 0;
+        for (int j = 0; j < label_num; j++) {
+            if (strcmp(sym_table[j].symbol, symcpy) == 0) {
+                *targetAddr = sym_table[j].addr;
+                found = 1;
+                break;
+            }
+        }
+        // 상수로 변환
+        if (!found) {
+            *targetAddr = (int)strtol(symcpy, NULL, 16);
+        }
+    }
+
+    // 6) ni 비트를 최종 오피코드로 만들기
     *finalOpcode = (baseOpcode & 0xFC) | ((*n << 1) | *i);
 }
 
-/* generate_object_code(): 주어진 토큰에 대해 object code 문자열 생성 (format 3/4)
-   이 함수에서는 opcode의 하위 2비트를 ni 비트로 채우고
-   PC-relative 방식으로 disp를 계산하는 로직을 구현함.
- */
+/* 토큰 포인터->인덱스 변환 (locctr_table 사용을 위해) */
+static int findTokenIndex(token *t) {
+    for (int idx = 0; idx < token_line; idx++) {
+        if (token_table[idx] == t) return idx;
+    }
+    return -1;
+}
+
+/* generate_object_code(): locctr_table 기반으로 disp 계산 */
 char* generate_object_code(token* t) {
-    int format = get_instruction_length(t->operator);
-    
-    int baseOpcode = search_opcode(t->operator);
+    printf("GEN_OBJ: op=\"%s\", fmt=%d, operand=\"%s\", baseOpcode=0x%02X\n",
+           t->operator,
+           get_instruction_length(t->operator),
+           t->operand[0] ? t->operand[0] : "",
+           search_opcode(t->operator));
+           
+    if (t->operand[0]) {
+        trim(t->operand[0]);
+        // 쉼표만 남았을 때도 제거
+        size_t L = strlen(t->operand[0]);
+        if (L > 0 && t->operand[0][L-1] == ',')
+            t->operand[0][L-1] = '\0';
+    }
+
+    int base = 0;
+    int format = get_instruction_length(t->operator);   // 명령어 format 추출
+    int baseOpcode = search_opcode(t->operator);    // 기본 opcode (8비트)
     if (baseOpcode < 0) baseOpcode = 0;
-    
-    // format 2 처리
+
+    // # 숫자 분기: LDA #3 같은 경우
+    // 여기서 바로 opcode, n, i, flags, disp 값을 계산 후 리턴
+    if (format != 2 &&
+        t->operand[0][0] == '#' &&
+        isdigit((unsigned char)t->operand[0][1])) {
+        printf("DEBUG immediate: op=\"%s\", baseOpcode=0x%02X\n",
+               t->operand[0], baseOpcode);
+
+
+
+        // 숫자 파싱: '#3' -> 3
+         int value = (int)strtol(t->operand[0] + 1, NULL, 0);
+         printf("DEBUG parsed value = %d (0x%X)\n", value, value);
+
+        // n = 0, i = 1, x=b=p=e=0
+        unsigned int opcode = (baseOpcode & 0xFC) | 0x01;
+        unsigned int flags = 0;
+
+        // format 3: 6자리 16진수 (3 바이트)
+        unsigned int instr = (opcode << 16) | (flags << 12) | (value & 0xFFF);
+        char *obj = malloc(7);
+        sprintf(obj, "%06X", instr);
+        return obj;
+    }
+
+    // Format 2: 레지스터 형식
     if (format == 2) {
         char opnd1[16] = {0}, opnd2[16] = {0};
-        sscanf(t->operand[0], "%15[^,],%15s", opnd1, opnd2);
+        int count = sscanf(t->operand[0], "%15[^,],%15s", opnd1, opnd2);
+
         int r1 = get_register_number(opnd1);
-        int r2 = get_register_number(opnd2);
+        int r2;
+        if (count == 2) {
+            // , 뒤에 2번째 레지스터가 있을 때만 반환
+            r2 = get_register_number(opnd2);
+        } else {
+            // 없으면 0
+            r2 = 0;
+        }
         unsigned int instr = (baseOpcode << 8) | (r1 << 4) | r2;
         char *obj = malloc(5);
+        if (!obj) {
+            perror("malloc failed");
+            return NULL;
+        }
         sprintf(obj, "%04X", instr);
         return obj;
     }
+
+    // Format 3/4 계산을 위해 각 플래그 및 OP 계산
+    int finalOpcode, n, i, x, e, targetAddr;
+    calc_nixbpe(t, baseOpcode, &finalOpcode, &n, &i, &x, &e, &targetAddr);  // opcode 리턴
+
+    // 현재 명령어의 주소를 locctr_table에서 얻음
+    int idx = findTokenIndex(t);
+    int currentAddr = locctr_table[idx];
     
-    // format 3/4 처리
-    int finalOpcode, n, i, x, e;
-    int targetAddr;
-    calc_nixbpe(t, baseOpcode, &finalOpcode, &n, &i, &x, &e, &targetAddr);
-    
-    // 여기서 t->addr는 해당 명령어의 시작 주소를 저장한다고 가정 (pass1에서 설정)
-    int currentAddr = t->addr;
-    
-    /* BASE relative 용 BASE 레지스터 값
-       BASE 지시어 처리 시 global 변수 (예: base_register)를 설정해두면 좋습니다.
-       여기서는 기본값 0으로 처리합니다.
-    */
-    int base = 0 ;   // 전역 base_register 값 또는 0
-    
+    // disp 계산 전 플래그 초기화
     int flag_b = 0, flag_p = 0;
-    // format 4이면 e == 1 → disp는 0으로 채워두고 M rec에서 수정
-    int disp = (e ? 0 :
-                calc_disp(targetAddr, currentAddr, format, base, e, &flag_b, &flag_p));
-    
-    // 4비트의 flag: x (bit3), b (bit2), p (bit1), e (bit0)
-    int flags = (x << 3) | (flag_b << 2) | (flag_p << 1) | e;
-    
-    unsigned int instr;
-    char* objStr;
-    
-    if (format == 3) {
-        // Format 3: 24비트 → 8비트 opcode, 4비트 flags, 12비트 disp
-        instr = (finalOpcode << 16)| (flags << 12) | (disp & 0xFFF);
-        objStr = malloc(7);  // 6 hex digits + null terminator
-        sprintf(objStr, "%06X", instr);
+    int disp;
+
+    // 간접 주소(@)가 숫자 상수일 경우: 16진수로 파싱
+    if (t->operand[0][0] == '@' && isdigit((unsigned char)t->operand[0][1])) {
+        disp = (int)strtol(t->operand[0] + 1, NULL, 0);
+        flag_b = 0; flag_p = 0;
+    } else {
+        // format 4인 경우엔 disp=0, M 레코드로 처리
+        if (e) {
+            disp = 0;
+        } else {
+            disp = calc_disp(targetAddr, currentAddr, format, base, e, &flag_b, &flag_p);
+        }
     }
-    else {  // Format 4
+
+    // nixbpe 플래그를 6비트 플래그로 인코딩 (x 비트는 이미 calc_nixbpe에서 설정됨)
+    int flags = (x << 3) | (flag_b << 2) | (flag_p << 1) | e;
+
+    // opcode 구성
+    unsigned int instr;
+    char *objStr;
+    if (format == 3) {
+        // 6자리 16진수
+        instr = (finalOpcode << 16) | (flags << 12) | (disp & 0xFFF);
+        objStr = malloc(7);
+        sprintf(objStr, "%06X", instr);
+    } else {
+        // format == 4: 8자리 16진수
         instr = (finalOpcode << 24) | (flags << 20) | (disp & 0xFFFFF);
-        objStr = (char*)malloc(9);  // 8 hex digits + null terminator
+        objStr = malloc(9);
         sprintf(objStr, "%08X", instr);
     }
     return objStr;
 }
 
 // format 4인 경우 M 레코드
-char* generate_modification_record(token* t) {
+char** generate_modification_records(token* t, int* count) {
+    // 토큰이나 operand가 없으면 NULL 리턴
     if (!t || !t->operand[0]) return NULL;
 
-    // format 4: M 레코드 주소는 instr addr + 1
+    // 수정할 주소는 명령어 시작 주소 + 1
     int mod_addr = t->addr + 1;
-    char* op = t->operand[0];
-    char* mod = malloc(32);
-    if (!mod) return NULL;
 
-    // BUFEND - BUFFER 처리
-    if (strchr(op, '-')) {
-        char sym1[32], sym2[32];
-        sscanf(op, "%31[^-]-%31s", sym1, sym2);
-        if (is_extref(sym1))
-            sprintf(mod, "M%06X06+%s", mod_addr, sym1);
-        else if (is_extref(sym2))
-            sprintf(mod, "M%06X06-%s", mod_addr, sym2);
-        else {
-            free(mod);
-            return NULL;
+    // M 레코드 최대 10개 가정
+    char** mods = malloc(sizeof(char*) * 10);
+    *count = 0;
+
+    char expr[64];
+    strcpy(expr, t->operand[0]);
+
+    // 오퍼랜드 문자열 복사 및 X 제거 (인덱스 주소 지정이 있으면 오퍼랜드만 추출)
+    char* comma = strstr(expr, ",X");
+    if (comma) *comma = '\0';
+
+    // parsing 시작
+    char *p = expr;
+    char op[32];
+    char sign = '+'; // 처음은 +
+
+    while (*p) {
+        // operator 추출
+        if (*p == '+' || *p == '-') {
+            sign = *p;
+            p++;
+            continue;
+        }
+
+        // operand 추출
+        sscanf(p, "%31[^+-]", op);
+        p += strlen(op);    // 다음 연산자로 이동
+
+        // 외부 심볼이면 M 레코드 생성
+        if (is_extref(op)) {
+            mods[*count] = malloc(32);
+            sprintf(mods[*count], "M%06X06%c%s", mod_addr, sign, op);
+            (*count)++;
         }
     }
-    // 단일 EXTREF symbol 처리
-    else if (is_extref(op)) {
-        sprintf(mod, "M%06X05+%s", mod_addr, op);
-    } else {
-        free(mod);
-        return NULL;
-    }
 
-    return mod;
+    return mods;
 }
 
 /* ----------------------------------------------------------------------------------
@@ -937,6 +1058,7 @@ char* generate_modification_record(token* t) {
 * 주의 :
 * -----------------------------------------------------------------------------------
 */
+// Pass 2: Object Code 생성 및 H/D/R/T/M/E 레코드 출력
 static int assem_pass2(void)
 {
     // H, T, M, E 레코드 생성
@@ -947,177 +1069,181 @@ static int assem_pass2(void)
         perror("Error opening object code output file");
         return -1;
     }
-    
+
+    int sectionCount = 0;
+
     // 각 control section 별로 object code를 생성함.
     // token_table의 순서대로 섹션이 연속된다고 가정하고 처리
     int i = 0;
-    while(i < token_line) {
-        // H 레코드 생성
-        token *first = token_table[i];
-        int secStart = first->addr;
-        char progName[7] = {0};
-        if (strlen(first->label) > 0)
-            strncpy(progName, first->label, 6);
-        else
-            strncpy(progName, first->operator, 6);
+    while (i < token_line) {
+        token *sectToken = token_table[i];
 
-        // 정확한 object code의 끝 위치 추적
-        int j = i;
-        int last_objcode_end = secStart;
+        // 프로그램 종료
+        if (!strcasecmp(sectToken->operator, "END"))
+            break;
         
-        int last_code_addr = -1;
-        int last_code_len = -1;
+        sectionCount++;
 
-        while (j < token_line) {
-            token *t = token_table[j];
+        // 섹션별 외부 참조 테이블 초기화
+        extref_count = 0;
 
-            // 섹션 종료 조건
-            if (j > i && (!strcasecmp(t->operator, "CSECT") || !strcasecmp(t->operator, "END")))
-                break;
+        // 해당 섹션의 시작 인덱스
+        int sectStartIdx = i;
 
-            int len = get_instruction_length(t->operator);
-            if (t->operator[0] == '+' && len == 0) len = 4;
-
-            // Object code를 생성하지 않는 directive 제외
-            if (!(!t->operator[0] ||
-                !strcasecmp(t->operator, "START") ||
-                !strcasecmp(t->operator, "CSECT") ||
-                !strcasecmp(t->operator, "END") ||
-                !strcasecmp(t->operator, "EQU") ||
-                !strcasecmp(t->operator, "EXTDEF") ||
-                !strcasecmp(t->operator, "EXTREF") ||
-                !strcasecmp(t->operator, "LTORG"))) {
-                if (t->addr + len > last_objcode_end)
-                    last_objcode_end = t->addr + len;
-            }
-
-            j++;
+        // 다음 섹션 경계 찾기
+        int endIdx = sectStartIdx + 1;
+        while (endIdx < token_line &&
+               strcasecmp(token_table[endIdx]->operator, "CSECT") &&
+               strcasecmp(token_table[endIdx]->operator, "END")) {
+            endIdx++;
         }
 
-        int secLength = (last_code_addr + last_code_len) - secStart;
+        int secStart = 0;   // 섹션이 시작하면 항상 주소 초기화
+        int secLength = 0;
 
-        // 전체 프로그램 길이 갱신 (전역 변수 필요: int total_program_end = 0;)
-        if ((last_code_addr + last_code_len) > total_program_end)
-            total_program_end = last_code_addr + last_code_len;
-
-        // 첫 섹션만 전체 길이 포함
-        if (i == 0)
-            fprintf(fp, "H %-6s %06X %06X\n", progName, secStart, total_program_end - secStart);
-        else
-            fprintf(fp, "H %-6s %06X %06X\n", progName, secStart, secLength);
-        
-        // D, R 레코드 생성
-        char dRecord[256] = {0};
-        char rRecord[256] = {0};
-        for (int k = i; k < j; k++) {
-            token *t = token_table[k];
-            if (strcasecmp(t->operator, "EXTDEF") == 0) {
-                char *def = strtok(t->operand[0], ",");
-                while(def != NULL) {
-                    // EXTDEF의 주소는 심볼 테이블에서 찾아야 함 (여기서는 0으로 처리한 예)
-                    char tmp[16];
-                    sprintf(tmp, "%-6s %06X ", def, 0);
-                    strcat(dRecord, tmp);
-                    def = strtok(NULL, ",");
-                }
-            }
-            if (strcasecmp(t->operator, "EXTREF") == 0) {
-                char *ref = strtok(t->operand[0], ",");
-                while(ref != NULL) {
-                    strcpy(extref_table[extref_count++], ref);
-                    strcat(rRecord, ref);
-                    strcat(rRecord, " ");
-                    ref = strtok(NULL, ",");
-                }
-            }
+        char progName[7] = {0}; 
+        if (strlen(sectToken->label) > 0) {
+            // CSECT 또는 START 이후의 레이블만 프로그램 이름으로
+            strncpy(progName, sectToken->label, 6);
         }
-        if (strlen(dRecord) > 0)
-            fprintf(fp, "D %s\n", dRecord);
-        if (strlen(rRecord) > 0)
-            fprintf(fp, "R %s\n", rRecord);
-        
-        // T, M 레코드 생성
-        int tRecStart = -1;
-        char tRecord[MAX_TEXT_RECORD_LENGTH * 2 + 1] = {0};
-        int tRecLength = 0;
-        char modRecords[100][32];
-        int modCount = 0;
 
-        // T, M 레코드 생성 루프 내부
-        for (int k = i; k < j; k++) {
+        for (int k = sectStartIdx + 1; k < endIdx; k++) {
             token *t = token_table[k];
-            
-            if (k > i && (!strcasecmp(t->operator, "CSECT") || !strcasecmp(t->operator, "END")))
-                break;
-
+            if (t->comment[0] == '.') continue;
             if (!t->operator[0] ||
                 !strcasecmp(t->operator, "START") ||
                 !strcasecmp(t->operator, "CSECT") ||
-                !strcasecmp(t->operator, "END") ||
-                !strcasecmp(t->operator, "EQU") ||
-                !strcasecmp(t->operator, "EXTDEF") ||
-                !strcasecmp(t->operator, "EXTREF") ||
+                !strcasecmp(t->operator, "END")   ||
+                !strcasecmp(t->operator, "EQU")   ||
+                !strcasecmp(t->operator, "EXTDEF")||
+                !strcasecmp(t->operator, "EXTREF")||
                 !strcasecmp(t->operator, "LTORG"))
                 continue;
 
-            // 실제 object code 생성
+            char *obj = generate_object_code(t);
+            if (obj && *obj) {
+                int len = strlen(obj) / 2;
+                int addr = locctr_table[k];     // 이 addrdms 0부터 카운트된 섹션 ㄴ 상대주소
+                if (addr + len > secLength)
+                    secLength = addr + len;
+            }
+            free(obj);
+        }
+
+        fprintf(fp, "H %-6s %06X %06X\n", progName, secStart, section_length[sectionCount]);
+
+        // D, R 레코드 생성
+        char dRecord[256] = {0};
+        char rRecord[256] = {0};
+        for (int k = sectStartIdx; k < endIdx; k++) {
+            token *t = token_table[k];
+            if (!strcasecmp(t->operator, "EXTDEF")) {
+                char *operand_copy = strdup(t->operand[0]);
+                char *sym = strtok(t->operand[0], ",");
+                while (sym) {
+                    // sym_table에서 같은 섹션(currentSectionCount)와 같이 이름이 일치하는 addr 검색
+                    unsigned int addr = 0;
+                    for (int s = 0; s < label_num; s++) {
+                        if (!strcmp(sym_table[s].symbol, sym) 
+                            && sym_table[s].section == sectionCount) {
+                            addr = sym_table[s].addr;
+                            break;
+                        }
+                    }
+                    char tmp[32];
+                    // %-6s: 이름, %06X: 6자리 16진수
+                    sprintf(tmp, "%-6s %06X ", sym, addr);
+                    strcat(dRecord, tmp);
+                    sym = strtok(NULL, ",");
+                }
+                free(operand_copy);
+            }
+            if (!strcasecmp(t->operator, "EXTREF")) {
+                char *sym = strtok(t->operand[0], ",");
+                while (sym) {
+                    strcpy(extref_table[extref_count++], sym);
+                    strcat(rRecord, sym);
+                    strcat(rRecord, " ");
+                    sym = strtok(NULL, ",");
+                }
+            }
+        }
+        if (dRecord[0]) fprintf(fp, "D %s\n", dRecord);
+        if (rRecord[0]) fprintf(fp, "R %s\n", rRecord);
+
+        // T, M 레코드 생성
+        int tRecStart = -1, tRecLen = 0, modCount = 0;
+        char tRecord[MAX_TEXT_RECORD_LENGTH * 2 + 1] = {0};
+        char modRecords[100][32];
+
+        // 섹션 내 모든 토큰 돌면서 T 레코드 축적 + M 레코드 모으기
+        for (int k = sectStartIdx + 1; k < endIdx; k++) {
+            token *t = token_table[k];
+            if (t->comment[0] == '.') continue;
+            if (!t->operator[0] ||
+                !strcasecmp(t->operator, "START") ||
+                !strcasecmp(t->operator, "CSECT") ||
+                !strcasecmp(t->operator, "END")   ||
+                !strcasecmp(t->operator, "EQU")   ||
+                !strcasecmp(t->operator, "EXTDEF")||
+                !strcasecmp(t->operator, "EXTREF")||
+                !strcasecmp(t->operator, "LTORG"))
+                continue;
+            // object code 생성 및 T 레코드 축적
             char *obj = generate_object_code(t);
             if (obj && *obj) {
                 int objBytes = strlen(obj) / 2;
-
-                // ✅ H 레코드용 마지막 위치 추적
-                last_code_addr = t->addr;
-                last_code_len = objBytes;
-
-                if (tRecLength == 0) tRecStart = t->addr;
-                if (tRecLength + objBytes > MAX_TEXT_RECORD_LENGTH) {
-                    fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLength, tRecord);
+                int addr = locctr_table[k];
+                if (tRecLen == 0) {
+                    tRecStart = addr;
+                }
+                if (tRecLen + objBytes > MAX_TEXT_RECORD_LENGTH) {
+                    // 새로운 T 레코드 시작
+                    fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
                     tRecord[0] = '\0';
-                    tRecLength = 0;
-                    tRecStart = t->addr;
+                    tRecLen = 0;
+                    tRecStart = addr;
                 }
-
                 strcat(tRecord, obj);
-                tRecLength += objBytes;
+                tRecLen += objBytes;
             }
+            free(obj);
 
-            // M 레코드 생성
+            // M 레코드 생성은 모아서
             if (t->operator[0] == '+') {
-                char* mod = generate_modification_record(t);
-                if (mod) {
-                    strcpy(modRecords[modCount++], mod);
-                    free(mod);
+                int mcount = 0; 
+                char **mods = generate_modification_records(t, &mcount);
+                for (int m = 0; m < mcount && modCount < 100; m++) {
+                    // 배열에 복사
+                    strncpy(modRecords[modCount], mods[m], sizeof(modRecords[0]) - 1);
+                    modRecords[modCount][sizeof(modRecords[0]) - 1] = '\0';
+                    modCount++;
+                    free(mods[m]);
                 }
+                free(mods);
             }
+        }
+        
+        // 남은 T 레코드 출력
+        if (tRecLen > 0) {
+            fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
+        }
 
-            free(obj);  // ✅ 여기서 해줘야 안전
-        }
-        
-        // 남은 T 레코드 flush
-        if (tRecLength > 0)
-            fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLength, tRecord);
-        // 출력한 모든 M 레코드
-        for (int m = 0; m < modCount; m++)
+        // 모아놓은 모든 M 레코드 순서대로 출력
+        for (int m = 0; m < modCount; m++) {
             fprintf(fp, "%s\n", modRecords[m]);
-        
-        // E 레코드: 섹션 시작 주소 기록
-        fprintf(fp, "E %06X\n", secStart);
-        
-        // 다음 섹션으로 건너뛰기
-        // i를 섹션 끝까지 올림 (END/CSECT 인덱스까지)
-        while (i < token_line &&
-               strcasecmp(token_table[i]->operator, "CSECT") != 0 &&
-               strcasecmp(token_table[i]->operator, "END") != 0) {
-            i++;
         }
-        
-        if ((last_code_addr + last_code_len) > total_program_end)
-            total_program_end = last_code_addr + last_code_len;
-        
-        // 첫 CSECT/END 토큰도 넘어가도록
-        i++;
+
+        // E 레코드 출력
+        if (i == 0)
+            fprintf(fp, "E %06X\n\n", secStart);
+        else 
+            fprintf(fp, "E\n\n");
+
+        // 다음 섹션으로 이동
+        i = endIdx;
     }
-    
+
     fclose(fp);
     return 0;
 }
