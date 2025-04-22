@@ -432,6 +432,7 @@ static int assem_pass1(void)
         token* t = token_table[i];
         // 3.1) 현재 locctr을 토큰의 주소로 저장
         t->addr = locctr;
+        t->section = current_section;
         locctr_table[i] = locctr;
 
         // 3.2) 주석 라인
@@ -906,16 +907,28 @@ void calc_nixbpe(token* t, int baseOpcode,
             *x = 1;
             *comma = '\0';
         }
-        // symbol 찾기
+
         int found = 0;
+        // (1) 같은 섹션에 정의된 심볼 먼저 찾기
         for (int j = 0; j < label_num; j++) {
-            if (strcmp(sym_table[j].symbol, symcpy) == 0) {
+            if (!strcmp(sym_table[j].symbol, symcpy)
+             && sym_table[j].section == t->section) {
                 *targetAddr = sym_table[j].addr;
                 found = 1;
                 break;
             }
         }
-        // 상수로 변환
+        // (2) 그래도 못 찾으면 외부 참조(EXTREF) 혹은 다른 섹션 심볼
+        if (!found) {
+            for (int j = 0; j < label_num; j++) {
+                if (!strcmp(sym_table[j].symbol, symcpy)) {
+                    *targetAddr = sym_table[j].addr;
+                    found = 1;
+                    break;
+                }
+            }
+        }
+        // (3) 여전히 못 찾으면 숫자 상수로 간주
         if (!found) {
             *targetAddr = (int)strtol(symcpy, NULL, 16);
         }
@@ -953,11 +966,6 @@ int isTextRecordable(token *t) {
 
 /* generate_object_code(): locctr_table 기반으로 disp 계산 */
 char* generate_object_code(token* t) {
-    printf("GEN_OBJ: op=\"%s\", fmt=%d, operand=\"%s\"\n",
-           t->operator,
-           get_instruction_length(t->operator),
-           t->operand[0] ? t->operand[0] : "");
-
     // 0) 미리 opcode 뽑아두기
     int baseOpcode = search_opcode(t->operator);
     if (baseOpcode < 0) baseOpcode = 0;
@@ -972,39 +980,21 @@ char* generate_object_code(token* t) {
         return obj;
     }
 
-    // 0) I/O format‑3 명령어 처리 (TD, WD) – 리터럴은 위에서 처리, 그 외는 아래 else 로 넘어감
+    // 0) I/O format‑3 명령어 처리 (TD, WD)
     if (!strcasecmp(t->operator, "TD") || !strcasecmp(t->operator, "WD")) {
-        const char *lit = t->operand[0];
-        if (lit[0] == '=') lit++;               // “=X'05'” 처럼 = 로 시작하면 건너뛰고
-        if (lit[0] == 'X' && lit[1] == '\'') {
-            // 리터럴 X'..' 형태
-            int deviceCode = strtol(lit + 2, NULL, 16);
-            unsigned int opcode = (search_opcode(t->operator) & 0xFC) | 0x03; // n=1,i=1
-            unsigned int instr = opcode << 16        // opcode+ni
-                                | (0          << 12) // x=b=p=e 모두 0
-                                | (deviceCode & 0xFFF);
-            char *obj = malloc(7);
-            sprintf(obj, "%06X", instr);
-            return obj;
-        }
-        else {
-            // ---- 여기가 핵심: 심볼(예: TD INPUT) 주소 지정 처리 ----
-            int finalOpc, n, i, x, e, targetAddr;
-            calc_nixbpe(t, baseOpcode, &finalOpc, &n, &i, &x, &e, &targetAddr);
+        int finalOpc, n, i, x, e, targetAddr;
+        calc_nixbpe(t, baseOpcode, &finalOpc, &n, &i, &x, &e, &targetAddr);
 
-            int idx         = findTokenIndex(t);
-            int currentAddr = locctr_table[idx];
-            int flag_b = 0, flag_p = 0;
+        int idx = findTokenIndex(t);
+        int currentAddr = locctr_table[idx];
+        int flag_b = 0, flag_p = 0;
+        int disp = calc_disp(targetAddr, currentAddr, 3, base, e, &flag_b, &flag_p);
+        int flags = (x << 3) | (flag_b << 2) | (flag_p << 1) | e;
+        unsigned int instr = (finalOpc << 16) | (flags << 12) | (disp & 0xFFF);
 
-            // base 레지스터 사용 시 설정
-            int disp = calc_disp(targetAddr, currentAddr, /*format=*/3, base, e, &flag_b, &flag_p);
-
-            int flags = (x << 3) | (flag_b << 2) | (flag_p << 1) | e;
-            unsigned int instr = (finalOpc << 16) | (flags << 12) | (disp & 0xFFF);
-            char *obj = malloc(7);
-            sprintf(obj, "%06X", instr);
-            return obj;
-        }
+        char *obj = malloc(7);
+        sprintf(obj, "%06X", instr);
+        return obj;
     }
 
     // 1) BYTE 지시어 처리 (C'...' 또는 X'...')
@@ -1060,14 +1050,8 @@ char* generate_object_code(token* t) {
     if (format != 2 &&
         t->operand[0][0] == '#' &&
         isdigit((unsigned char)t->operand[0][1])) {
-        printf("DEBUG immediate: op=\"%s\", baseOpcode=0x%02X\n",
-               t->operand[0], baseOpcode);
-
-
-
         // 숫자 파싱: '#3' -> 3
          int value = (int)strtol(t->operand[0] + 1, NULL, 0);
-         printf("DEBUG parsed value = %d (0x%X)\n", value, value);
 
         // n = 0, i = 1, x=b=p=e=0
         unsigned int opcode = (baseOpcode & 0xFC) | 0x01;
@@ -1162,7 +1146,7 @@ char** generate_modification_records(token* t, int* count) {
     *count = 0;
 
     // WORD directive의 relative expression 처리
-        if (!strcasecmp(t->operator, "WORD")) {
+    if (!strcasecmp(t->operator, "WORD")) {
         char expr[64];
         strcpy(expr, t->operand[0]);
         char *p;

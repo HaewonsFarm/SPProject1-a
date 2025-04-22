@@ -42,6 +42,7 @@ typedef struct _token
     char comment[100];
     char nixbpe;
     int addr;   // 주소 정보 저장(추가)
+    int section;    // 섹션 추가
 } token;
 
 extern token* token_table[MAX_LINES];
