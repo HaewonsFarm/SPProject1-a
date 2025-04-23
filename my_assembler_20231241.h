@@ -41,8 +41,8 @@ typedef struct _token
     char* operand[MAX_OPERAND];
     char comment[100];
     char nixbpe;
-    int addr;   // 주소 정보 저장(추가)
-    int section;    // 섹션 추가
+    int addr;   // 명령어의 주소 정보를 저장하기 위해 추가하였다.
+    int section;    // 명령어의 섹션 정보를 저장하기 위해 추가하였다.
 } token;
 
 extern token* token_table[MAX_LINES];
@@ -57,7 +57,7 @@ typedef struct _symbol
 {
     char symbol[10];
     int addr;
-    int section;    // 새로 추가: 심볼이 속한 섹션 번호 (407호 엄지환 조교님)
+    int section;    // 심볼이 속한 섹션 번호를 저장하기 위해 추가하였다.
 } symbol;
 
 /*

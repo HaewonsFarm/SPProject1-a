@@ -73,6 +73,8 @@ void process_literal_pool(void);
 static int get_register_number(const char *r);
 int calc_disp(int target, int current, int format, int base, int e, int *b, int *p);
 void calc_nixbpe(token* t, int baseOpcode, int *finalOpcode, int *n, int *i,int *x, int *e, int *targetAddr);
+static int findTokenIndex(token *t);
+int isTextRecordable(token *t);
 char* generate_object_code(token* t);
 char** generate_modification_records(token* t, int* count);
 static int assem_pass2(void);
@@ -481,8 +483,6 @@ static int assem_pass1(void)
             }
 
             continue;
-
-            // 여기서 locctr은 계산이 잘 된다.
         }
 
         // LTORG 또는 END 시점에 리터럴 풀 처리
@@ -1166,7 +1166,7 @@ char** generate_modification_records(token* t, int* count) {
             if (is_extref(sym)) {
                 char buf[64];
                 // WORD는 6 half-bytes (여기서는 주소 보정 필요 없이 처음부터 수정하므로 +1 해줬던 거 뺀다.)
-                sprintf(buf, "M %06X 06 %c%s", mod_addr-1, sign, sym);
+                sprintf(buf, "M%06X06%c%s", mod_addr-1, sign, sym);
                 mods[(*count)++] = strdup(buf);
             }
         }
@@ -1196,7 +1196,7 @@ char** generate_modification_records(token* t, int* count) {
 
             if (is_extref(sym)) {
                 char buf[64];
-                sprintf(buf, "M %06X 05 %c%s", mod_addr, sign, sym);
+                sprintf(buf, "M%06X05%c%s", mod_addr, sign, sym);
                 mods[(*count)++] = strdup(buf);
             }
         }
@@ -1284,14 +1284,14 @@ static int assem_pass2(void)
             char *obj = generate_object_code(t);
             if (obj && *obj) {
                 int len = strlen(obj) / 2;
-                int addr = locctr_table[k];     // 이 addrdms 0부터 카운트된 섹션 ㄴ 상대주소
+                int addr = locctr_table[k];     // 이 addrdms 0부터 카운트된 섹션 상대주소
                 if (addr + len > secLength)
                     secLength = addr + len;
             }
             free(obj);
         }
 
-        fprintf(fp, "H %-6s %06X %06X\n", progName, secStart, section_length[sectionCount]);
+        fprintf(fp, "H%-7s%06X%06X\n", progName, secStart, section_length[sectionCount]);
 
         // D, R 레코드 생성
         char dRecord[256] = {0};
@@ -1313,24 +1313,30 @@ static int assem_pass2(void)
                     }
                     char tmp[32];
                     // %-6s: 이름, %06X: 6자리 16진수
-                    sprintf(tmp, "%-6s %06X ", sym, addr);
+                    sprintf(tmp, "%-6s%06X", sym, addr);
                     strcat(dRecord, tmp);
                     sym = strtok(NULL, ",");
                 }
                 free(operand_copy);
             }
             if (!strcasecmp(t->operator, "EXTREF")) {
+                char *operand_copy = strdup(t->operand[0]);
                 char *sym = strtok(t->operand[0], ",");
                 while (sym) {
-                    strcpy(extref_table[extref_count++], sym);
-                    strcat(rRecord, sym);
-                    strcat(rRecord, " ");
-                    sym = strtok(NULL, ",");
+                strcpy(extref_table[extref_count++], sym);
+
+                // 심볼을 6자리 왼쪽 정렬로 포맷
+                char tmp[8];
+                sprintf(tmp, "%-6s", sym);
+                strcat(rRecord, tmp);
+
+                sym = strtok(NULL, ",");
                 }
+                free(operand_copy);
             }
         }
-        if (dRecord[0]) fprintf(fp, "D %s\n", dRecord);
-        if (rRecord[0]) fprintf(fp, "R %s\n", rRecord);
+        if (dRecord[0]) fprintf(fp, "D%s\n", dRecord);
+        if (rRecord[0]) fprintf(fp, "R%s\n", rRecord);
 
         // T, M 레코드 생성
         int tRecStart = -1, tRecLen = 0, modCount = 0;
@@ -1342,32 +1348,49 @@ static int assem_pass2(void)
         for (int k = sectStartIdx + 1; k < endIdx; k++) {
             token *t = token_table[k];
 
-            // 1) 텍스트 레코드에 포함되지 않을 토큰(지시어·주석·RESW/RESB 등)은 건너뛴다
-            if (!isTextRecordable(t)) continue;
-
-            // 2) 객체 코드 생성
-            char *obj = generate_object_code(t);
-            if (!obj || *obj == '\0') {
-                free(obj);
+            // LTORG 처리
+            if (!strcasecmp(t->operator, "LTORG")) {
+                // 1) 남은 T–레코드 flush
+                if (tRecLen > 0) {
+                    fprintf(fp, "T%06X%02X%s\n", tRecStart, tRecLen, tRecord);
+                    tRecLen = 0; tRecord[0] = '\0';
+                }
+                // 2) 아직 출력 안 한 리터럴만 독립 레코드로
+                for (int j = literalPoolStartSec[sec]; j < literalPoolEndSec[sec]; j++) {
+                    int relAddr = literal_table[j].addr - sectionStartAddr[sec];
+                    char litValue[64];
+                    extract_literal(literal_table[j].symbol, litValue);
+                    int litBytes = (toupper(literal_table[j].symbol[1])=='C')
+                                ? strlen(litValue)
+                                : strlen(litValue)/2;
+                    // 독립 T–레코드
+                    fprintf(fp, "T%06X%02X", relAddr, litBytes);
+                    if (toupper(literal_table[j].symbol[1])=='C') {
+                        for (int x = 0; x < litBytes; x++)
+                            fprintf(fp, "%02X", (unsigned char)litValue[x]);
+                    } else {
+                        fprintf(fp, "%s", litValue);
+                    }
+                    fprintf(fp, "\n");
+                }
+                // 출력 완료 표시
+                literalPoolStartSec[sec] = literalPoolEndSec[sec];
                 continue;
             }
-            int objBytes = strlen(obj) / 2;
-            int addr     = locctr_table[k];
 
-            // 3) 새 T 레코드 시작 주소 설정
-            if (tRecLen == 0) {
+            // (2) 텍스트 레코드에 포함되지 않을 토큰은 건너뛴다
+            if (!isTextRecordable(t)) continue;
+
+            // 3) 객체 코드 생성 및 T-레코드 overflow 체크
+            char *obj = generate_object_code(t);
+            int objBytes = strlen(obj)/2;
+            int addr     = locctr_table[k];
+            if (tRecLen == 0) tRecStart = addr;
+            if (tRecLen + objBytes > MAX_TEXT_RECORD_LENGTH) {
+                fprintf(fp, "T%06X%02X%s\n", tRecStart, tRecLen, tRecord);
+                tRecLen = 0; tRecord[0] = '\0';
                 tRecStart = addr;
             }
-
-            // 4) 길이 한도를 넘으면 기존 T 레코드 플러시
-            if (tRecLen + objBytes > MAX_TEXT_RECORD_LENGTH) {
-                fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
-                tRecord[0] = '\0';
-                tRecLen    = 0;
-                tRecStart  = addr;
-            }
-            
-            // 5) 객체 코드 누적
             strcat(tRecord, obj);
             tRecLen += objBytes;
             free(obj);
@@ -1386,44 +1409,41 @@ static int assem_pass2(void)
             }
         }
 
-        // 리터럴 풀 처리: LTORG/END 시점 객체
-        for (int j = literalPoolStartSec[sec]; j < literalPoolEndSec[sec]; j++) {
-            int relAddr = literal_table[j].addr - sectionStartAddr[sec];
-            char litValue[32] = {0};
-            extract_literal(literal_table[j].symbol, litValue);
+        // END
+        if (!strcasecmp(token_table[endIdx]->operator, "END")) {
+            // 아직 출력 안 한 리터럴만
+            for (int j = literalPoolStartSec[sec]; j < literalPoolEndSec[sec]; j++) {
+                int relAddr = literal_table[j].addr - sectionStartAddr[sec];
+                char litValue[64];
+                extract_literal(literal_table[j].symbol, litValue);
+                int litBytes = (toupper(literal_table[j].symbol[1])=='C')
+                            ? strlen(litValue)
+                            : strlen(litValue)/2;
 
-            char *litObj;
-            if (toupper(literal_table[j].symbol[1]) == 'C') {
-                int len = strlen(litValue);
-                litObj = malloc(len*2 + 1);
-                litObj[0] = '\0';
-                for (int k = 0; k < len; k++) {
-                    char hx[3];
-                    sprintf(hx, "%02X", (unsigned char)litValue[k]);
-                    strcat(litObj, hx);
+                // 공간 체크: append 가능한지
+                if (tRecLen + litBytes > MAX_TEXT_RECORD_LENGTH) {
+                    // 넘으면 flush
+                    fprintf(fp, "T%06X%02X%s\n", tRecStart, tRecLen, tRecord);
+                    tRecLen = 0; tRecord[0] = '\0';
+                    tRecStart = relAddr;
                 }
-            } else {
-                litObj = strdup(litValue);
+                // append
+                if (toupper(literal_table[j].symbol[1])=='C') {
+                    for (int x = 0; x < litBytes; x++) {
+                        char hx[3];
+                        sprintf(hx, "%02X", (unsigned char)litValue[x]);
+                        strcat(tRecord, hx);
+                    }
+                } else {
+                    strcat(tRecord, litValue);
+                }
+                tRecLen += litBytes;
             }
-
-            int litBytes = strlen(litObj) / 2;
-
-            if (tRecLen + litBytes > MAX_TEXT_RECORD_LENGTH) {
-                // 기존 T 레코드 flush
-                fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
-                tRecord[0] = '\0';
-                tRecLen = 0;
-                tRecStart = relAddr;
-            }
-            // append ligObj
-            strcat(tRecord, litObj);
-            tRecLen += litBytes;
-            free(litObj);
         }
 
-        // 마지막 T 레코드 flush
+        // 마지막 T-레코드 flush
         if (tRecLen > 0) {
-            fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
+            fprintf(fp, "T%06X%02X%s\n", tRecStart, tRecLen, tRecord);
         }
 
 
@@ -1433,10 +1453,17 @@ static int assem_pass2(void)
         }
 
         // E 레코드 출력
-        if (i == 0)
-            fprintf(fp, "E %06X\n\n", secStart);
-        else 
+        _Bool isLastSection = !strcasecmp(token_table[endIdx]->operator, "END");
+        if (i == 0) {
+            // 첫 섹션은 E레코드 뒤에 빈 줄 하나
+            fprintf(fp, "E%06X\n\n", secStart);
+        } else if (isLastSection) {
+            // 마지막 섹션이면 개행 하나만
+            fprintf(fp, "E\n");
+        } else {
+            // 중간 섹션은 빈 줄 하나
             fprintf(fp, "E\n\n");
+        }
 
         // 다음 섹션으로 이동
         i = endIdx;
