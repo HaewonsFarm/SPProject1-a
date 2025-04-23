@@ -1135,84 +1135,75 @@ char* generate_object_code(token* t) {
 
 // format 4인 경우 M 레코드
 char** generate_modification_records(token* t, int* count) {
-    // 토큰이나 operand가 없으면 NULL 리턴
     if (!t || !t->operand[0]) return NULL;
 
-    // 수정할 주소는 명령어 시작 주소 + 1 (relative expression은 아님)
-    int mod_addr = t->addr + 1;
-
-    // M 레코드 최대 10개 가정
-    char** mods = malloc(sizeof(char*) * 10);
+    int mod_addr = t->addr + 1;            // 수정 시작 주소
+    char **mods = malloc(sizeof(char*) * MAX_OPERAND);
     *count = 0;
 
-    // WORD directive의 relative expression 처리
+    // WORD 지시어의 relative expression 처리
     if (!strcasecmp(t->operator, "WORD")) {
         char expr[64];
         strcpy(expr, t->operand[0]);
-        char *p;
-        // ‘-’ 연산자 처리
-        if ((p = strchr(expr, '-'))) {
-            *p = '\0';
-            char *sym1 = expr;
-            char *sym2 = p + 1;
-            char buf[32];
-            sprintf(buf, "M %06X 06 +%s", mod_addr-1, sym1);
-            mods[(*count)++] = strdup(buf);
-            sprintf(buf, "M %06X 06 -%s", mod_addr-1, sym2);
-            mods[(*count)++] = strdup(buf);
-        }
-        // ‘+’ 연산자 처리
-        else if ((p = strchr(expr, '+'))) {
-            *p = '\0';
-            char *sym1 = expr;
-            char *sym2 = p + 1;
-            char buf[32];
-            sprintf(buf, "M%06X06+%s", mod_addr-1, sym1);
-            mods[(*count)++] = strdup(buf);
-            sprintf(buf, "M%06X06+%s", mod_addr-1, sym2);
-            mods[(*count)++] = strdup(buf);
-        }
-        // 단일 심볼
-        else {
-            char buf[32];
-            sprintf(buf, "M%06X06+%s", mod_addr, expr);
-            mods[(*count)++] = strdup(buf);
+        char *p = expr;
+        char sign = '+';                  // 첫 term은 '+' 가 기본
+        while (*p && *count < MAX_OPERAND) {
+            // 1) 부호 처리
+            if (*p == '+' || *p == '-') {
+                sign = *p++;
+                continue;
+            }
+            // 2) 심볼 이름 읽기
+            char sym[32];
+            int len = strspn(p, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                              "abcdefghijklmnopqrstuvwxyz"
+                              "0123456789_");
+            if (len == 0) break;
+            strncpy(sym, p, len); sym[len] = '\0';
+            p += len;
+
+            // 3) EXTREF 심볼만 M-레코드 생성
+            if (is_extref(sym)) {
+                char buf[64];
+                // WORD는 6 half-bytes (여기서는 주소 보정 필요 없이 처음부터 수정하므로 +1 해줬던 거 뺀다.)
+                sprintf(buf, "M %06X 06 %c%s", mod_addr-1, sign, sym);
+                mods[(*count)++] = strdup(buf);
+            }
         }
         return mods;
     }
 
-    char expr[64];
-    strcpy(expr, t->operand[0]);
+    // format 4 명령어 (+) 또는 일반 명령어의 operand 내 심볼 처리
+    if (t->operator[0] == '+') {
+        // format 4 → 5 half-bytes
+        char expr[64];
+        strcpy(expr, t->operand[0]);
+        // 인덱싱(",X") 제거
+        char *comma = strstr(expr, ",X");
+        if (comma) *comma = '\0';
 
-    // 오퍼랜드 문자열 복사 및 X 제거 (인덱스 주소 지정이 있으면 오퍼랜드만 추출)
-    char* comma = strstr(expr, ",X");
-    if (comma) *comma = '\0';
+        char *p = expr;
+        char sign = '+';
+        while (*p && *count < MAX_OPERAND) {
+            if (*p=='+' || *p=='-') { sign = *p++; continue; }
+            char sym[32];
+            int len = strspn(p, "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                              "abcdefghijklmnopqrstuvwxyz"
+                              "0123456789_");
+            if (len == 0) break;
+            strncpy(sym, p, len); sym[len] = '\0';
+            p += len;
 
-    // parsing 시작
-    char *p = expr;
-    char op[32];
-    char sign = '+'; // 처음은 +
-
-    while (*p) {
-        // operator 추출
-        if (*p == '+' || *p == '-') {
-            sign = *p;
-            p++;
-            continue;
+            if (is_extref(sym)) {
+                char buf[64];
+                sprintf(buf, "M %06X 05 %c%s", mod_addr, sign, sym);
+                mods[(*count)++] = strdup(buf);
+            }
         }
-
-        // operand 추출
-        sscanf(p, "%31[^+-]", op);
-        p += strlen(op);    // 다음 연산자로 이동
-
-        // 외부 심볼이면 M 레코드 생성
-        if (is_extref(op)) {
-            mods[*count] = malloc(32);
-            sprintf(mods[*count], "M %06X 05 %c%s", mod_addr, sign, op);
-            (*count)++;
-        }
+        return mods;
     }
 
+    // 그 외(예: format 3 명령어) – 필요시 추가 처리
     return mods;
 }
 
@@ -1395,11 +1386,6 @@ static int assem_pass2(void)
             }
         }
 
-        // 남은 T 레코드 출력
-        if (tRecLen > 0) {
-            fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
-        }
-
         // 리터럴 풀 처리: LTORG/END 시점 객체
         for (int j = literalPoolStartSec[sec]; j < literalPoolEndSec[sec]; j++) {
             int relAddr = literal_table[j].addr - sectionStartAddr[sec];
@@ -1412,7 +1398,8 @@ static int assem_pass2(void)
                 litObj = malloc(len*2 + 1);
                 litObj[0] = '\0';
                 for (int k = 0; k < len; k++) {
-                    char hx[3]; sprintf(hx, "%02X", (unsigned char)litValue[k]);
+                    char hx[3];
+                    sprintf(hx, "%02X", (unsigned char)litValue[k]);
                     strcat(litObj, hx);
                 }
             } else {
@@ -1420,8 +1407,23 @@ static int assem_pass2(void)
             }
 
             int litBytes = strlen(litObj) / 2;
-            fprintf(fp, "T %06X %02X %s\n", relAddr, litBytes, litObj);
+
+            if (tRecLen + litBytes > MAX_TEXT_RECORD_LENGTH) {
+                // 기존 T 레코드 flush
+                fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
+                tRecord[0] = '\0';
+                tRecLen = 0;
+                tRecStart = relAddr;
+            }
+            // append ligObj
+            strcat(tRecord, litObj);
+            tRecLen += litBytes;
             free(litObj);
+        }
+
+        // 마지막 T 레코드 flush
+        if (tRecLen > 0) {
+            fprintf(fp, "T %06X %02X %s\n", tRecStart, tRecLen, tRecord);
         }
 
 
